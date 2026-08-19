@@ -304,12 +304,19 @@ struct ConvertInsertTile
       mlir::ConversionPatternRewriter& rewriter) const override {
     mlir::Location loc = op.getLoc();
     Value source_vector = adaptor.getSource();
-    mlir::VectorType source_vector_type =
-        mlir::cast<mlir::VectorType>(source_vector.getType());
+    auto source_vector_type =
+        mlir::dyn_cast<mlir::VectorType>(source_vector.getType());
 
     ValueRange offsets = adaptor.getOffsets();
     Value dest_memref = adaptor.getDestination();
     auto dest_memref_type = mlir::cast<mlir::MemRefType>(dest_memref.getType());
+
+    if (!source_vector_type) {
+      mlir::memref::StoreOp::create(rewriter, loc, source_vector, dest_memref,
+                                    offsets);
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
 
     if (llvm::any_of(op.getStrides(), llvm::not_equal_to<int64_t>(1))) {
       EmitElements(rewriter, loc, source_vector_type.getShape(), offsets,
