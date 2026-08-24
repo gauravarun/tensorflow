@@ -56,6 +56,7 @@ limitations under the License.
 #include "flatbuffers/vector.h"  // from @flatbuffers
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -64,6 +65,7 @@ limitations under the License.
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/SwapByteOrder.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"  // from @llvm-project
 #include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
 #include "mlir/Dialect/Quant/IR/QuantTypes.h"  // from @llvm-project
@@ -1107,6 +1109,26 @@ Translator::BuildExternalBuffer(mlir::Value value,
   return external_buffer;
 }
 
+static uint64_t GetPhysicalBufferHash(mlir::ElementsAttr attr) {
+  if (auto resource_attr =
+          mlir::dyn_cast<mlir::DenseResourceElementsAttr>(attr)) {
+    mlir::AsmResourceBlob* blob = resource_attr.getRawHandle().getBlob();
+    if (!blob && resource_attr.getRawHandle().getResource()) {
+      blob = resource_attr.getRawHandle().getResource()->getBlob();
+    }
+    uint64_t h = 0;
+    if (blob && !blob->getData().empty()) {
+      h = llvm::xxh3_64bits(
+          reinterpret_cast<const uint8_t*>(blob->getData().data()),
+          blob->getData().size());
+    } else {
+      h = llvm::hash_value(resource_attr.getRawHandle().getKey().str());
+    }
+    return llvm::hash_combine(h, mlir::hash_value(resource_attr.getType()));
+  }
+  return mlir::hash_value(attr);
+}
+
 std::optional<BufferOffset<tflite::Buffer>> Translator::BuildBuffer(
     mlir::Value value, bool can_be_deduplicated, int& index) {
   can_be_deduplicated = can_be_deduplicated && !disable_buffer_deduping_;
@@ -1166,6 +1188,35 @@ std::optional<BufferOffset<tflite::Buffer>> Translator::BuildBuffer(
         [tflite_element_type](
             const std::pair<mlir::Attribute, mlir::Operation*>& attr_and_inst,
             auto apply) {
+          if (auto res_attr = mlir::dyn_cast<mlir::DenseResourceElementsAttr>(
+                  attr_and_inst.first)) {
+            mlir::AsmResourceBlob* blob = res_attr.getRawHandle().getBlob();
+            if (!blob && res_attr.getRawHandle().getResource()) {
+              blob = res_attr.getRawHandle().getResource()->getBlob();
+            }
+            if (blob && !blob->getData().empty()) {
+              absl::string_view raw_data(
+                  reinterpret_cast<const char*>(blob->getData().data()),
+                  blob->getData().size());
+              bool is_8bit_raw_data =
+                  raw_data.size() == res_attr.getNumElements();
+              bool is_4bit_data =
+                  tflite_element_type == tflite::TensorType_INT4 ||
+                  tflite_element_type == tflite::TensorType_UINT4;
+              if (is_8bit_raw_data) {
+                if (is_4bit_data) {
+                  return tflite::StreamPackLowBitValues8Bit</*kBitWidth=*/4>(
+                      raw_data, apply);
+                } else {
+                  return tflite::StreamPackLowBitValues8Bit</*kBitWidth=*/2>(
+                      raw_data, apply);
+                }
+              } else {
+                return apply(raw_data);
+              }
+            }
+          }
+
           auto attr = mlir::cast<mlir::DenseElementsAttr>(attr_and_inst.first);
           bool is_8bit_raw_data =
               !attr.isSplat() &&
@@ -1204,7 +1255,9 @@ std::optional<BufferOffset<tflite::Buffer>> Translator::BuildBuffer(
           // is big endian, rely on the TensorFlow path below to reverse the
           // byte order.
           if (llvm::sys::IsLittleEndianHost && shaped_type &&
-              shaped_type.getElementType().isIntOrFloat()) {
+              (shaped_type.getElementType().isIntOrFloat() ||
+               mlir::isa<mlir::quant::QuantizedType>(
+                   shaped_type.getElementType()))) {
             int64_t expected_size = mlir::TFL::GetSizeInBytes(shaped_type);
 
             // DenseElementsAttr
@@ -1222,12 +1275,15 @@ std::optional<BufferOffset<tflite::Buffer>> Translator::BuildBuffer(
             // DenseResourceElementsAttr
             if (auto res_attr =
                     mlir::dyn_cast<mlir::DenseResourceElementsAttr>(attr)) {
-              if (auto blob =
-                      res_attr.getRawHandle().getResource()->getBlob()) {
-                auto data = blob->getData();
-                if (data.size() == expected_size) {
+              mlir::AsmResourceBlob* blob = res_attr.getRawHandle().getBlob();
+              if (!blob && res_attr.getRawHandle().getResource()) {
+                blob = res_attr.getRawHandle().getResource()->getBlob();
+              }
+              if (blob && !blob->getData().empty()) {
+                if (blob->getData().size() == expected_size) {
                   return apply(absl::string_view(
-                      reinterpret_cast<const char*>(data.data()), data.size()));
+                      reinterpret_cast<const char*>(blob->getData().data()),
+                      blob->getData().size()));
                 }
               }
             }
@@ -1291,9 +1347,10 @@ std::optional<BufferOffset<tflite::Buffer>> Translator::BuildBuffer(
     // string and computing the hash of the string, but can be reliable in some
     // cases where the MLIR attributes are not deduped properly (e.g. when two
     // consts of the same value are held in different attribute types).
+    uint64_t h = GetPhysicalBufferHash(attr);
     const_buffer_storage_.Insert(
         index, std::make_pair(attr, inst), std::move(applier),
-        /*hash=*/mlir::hash_value(attr),
+        /*hash=*/h,
         /*byte_size_hint=*/mlir::TFL::GetSizeInBytes(type));
     return tflite::CreateBuffer(builder_, 0, 1, 1);
   } else {
@@ -3371,7 +3428,9 @@ void Translator::InitializeNamesFromAttribute(FuncOp fn, bool* has_input_attr) {
       return;
     }
     for (const auto& it : llvm::enumerate(fn.getArguments())) {
-      name_mapper_.InitOpName(it.value(), input_names[it.index()].trim());
+      auto name = input_names[it.index()].trim();
+      auto unique_name = name_mapper_.GetUniqueName(name);
+      name_mapper_.InitOpName(it.value(), unique_name);
     }
     *has_input_attr = true;
   }
@@ -3388,7 +3447,12 @@ void Translator::InitializeNamesFromAttribute(FuncOp fn, bool* has_input_attr) {
       return;
     }
     for (const auto& it : llvm::enumerate(term->getOperands())) {
-      name_mapper_.InitOpName(it.value(), output_names[it.index()].trim());
+      if (name_mapper_.GetMappedName(it.value()).has_value()) {
+        continue;
+      }
+      auto name = output_names[it.index()].trim();
+      auto unique_name = name_mapper_.GetUniqueName(name);
+      name_mapper_.InitOpName(it.value(), unique_name);
     }
   }
 }
@@ -4050,7 +4114,9 @@ std::vector<SignatureDefData> BuildSignaturedef(
   // We create vector of size 1 as TFLite now supports only 1 signatureDef.
   std::vector<SignatureDefData> result(1);
   for (int i = 0; i < input_names.size(); ++i) {
-    result[0].inputs[sig_def_inputs[i]] = input_names[i].str();
+    auto unique_name =
+        std::string(name_mapper.GetUniqueName(main_op.getArgument(i)));
+    result[0].inputs[sig_def_inputs[i]] = unique_name;
   }
   for (int i = 0; i < output_names.size(); ++i) {
     // Fetch the name from the actual operand and not rely on names from
@@ -4144,9 +4210,11 @@ absl::Status Translator::Translate(
     op_or_arg_name_mapper = &default_op_or_arg_name_mapper;
   }
   if (!UpdateEntryFunction(module)) {
+    LOG(ERROR) << "No entry function found in the module.";
     return absl::InvalidArgumentError("No entry function found.");
   }
   if (!IsValidTFLiteMlirModule(module)) {
+    LOG(ERROR) << "Invalid TFLite MLIR module.";
     return absl::InvalidArgumentError("Invalid TFLite MLIR module.");
   }
 
@@ -4721,6 +4789,7 @@ bool MlirToFlatBufferTranslateFunction(mlir::ModuleOp module,
   }
 
   if (!status.ok()) {
+    LOG(ERROR) << "Flatbuffer export failed: " << status.message();
     return false;
   }
   serialized_flatbuffer->assign(buffer.data(), buffer.size());

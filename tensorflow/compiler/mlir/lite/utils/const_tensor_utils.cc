@@ -507,12 +507,13 @@ int64_t GetSizeInBits(mlir::Type type) {
     if (mlir::isa<mlir::ComplexType>(shaped_type.getElementType())) {
       auto complex_type =
           mlir::cast<mlir::ComplexType>(shaped_type.getElementType());
-      return GetSizeInBits(complex_type.getElementType()) * 2;
+      return GetSizeInBits(complex_type.getElementType()) * 2 *
+             shaped_type.getNumElements();
     } else if (mlir::isa<mlir::quant::QuantizedType>(
                    shaped_type.getElementType())) {
       auto quant_type =
           mlir::cast<mlir::quant::QuantizedType>(shaped_type.getElementType());
-      return GetSizeInBits(quant_type);
+      return GetSizeInBits(quant_type) * shaped_type.getNumElements();
     } else {
       return GetSizeInBits(shaped_type);
     }

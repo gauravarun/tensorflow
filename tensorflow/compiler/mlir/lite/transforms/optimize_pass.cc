@@ -67,8 +67,7 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.h"
 #include "tensorflow/compiler/mlir/tensorflow/utils/dynamic_shape_utils.h"
 
-namespace mlir {
-namespace TFL {
+namespace mlir::TFL {
 
 //===----------------------------------------------------------------------===//
 // The actual Optimize Pass.
@@ -79,24 +78,42 @@ constexpr char kRelu6[] = "RELU6";
 constexpr char kRelu1[] = "RELU_N1_TO_1";
 
 ElementsAttr FlattenTo1D(Attribute a) {
-  auto elements = mlir::cast<DenseElementsAttr>(a);
-  const std::array<int64_t, 1> flattened_shape = {elements.getNumElements()};
-  auto new_type = RankedTensorType::get(flattened_shape,
-                                        elements.getType().getElementType());
-  return elements.reshape(new_type);
+  if (auto elements = mlir::dyn_cast_or_null<DenseElementsAttr>(a)) {
+    const std::array<int64_t, 1> flattened_shape = {elements.getNumElements()};
+    auto new_type =
+        RankedTensorType::get(flattened_shape, elements.getElementType());
+    return elements.reshape(new_type);
+  }
+  if (auto resource_attr =
+          mlir::dyn_cast_or_null<DenseResourceElementsAttr>(a)) {
+    const std::array<int64_t, 1> flattened_shape = {
+        resource_attr.getNumElements()};
+    auto new_type =
+        RankedTensorType::get(flattened_shape, resource_attr.getElementType());
+    return DenseResourceElementsAttr::get(new_type,
+                                          resource_attr.getRawHandle());
+  }
+  return {};
 }
 
 // This assumes that the bias is of shape NxCx1x1 and doesn't require transpose
 // Its corresponding constraint is optimize_patterns.td:IsBiasShape()
 ElementsAttr ReshapeNCHWBiasToNHWC(Value v, Attribute a) {
-  auto elements = mlir::cast<DenseElementsAttr>(a);
+  auto attr = mlir::dyn_cast_or_null<ElementsAttr>(a);
+  if (!attr) return {};
   auto shape = mlir::cast<ShapedType>(v.getType()).getShape();
-  if (shape.size() != 4 || shape[2] != 1 || shape[3] != 1) return elements;
+  if (shape.size() != 4 || shape[2] != 1 || shape[3] != 1) return attr;
   const std::array<int64_t, 4> new_shape = {shape[0], shape[2], shape[3],
                                             shape[1]};
-  auto new_type =
-      RankedTensorType::get(new_shape, elements.getType().getElementType());
-  return elements.reshape(new_type);
+  auto new_type = RankedTensorType::get(new_shape, attr.getElementType());
+  if (auto elements = mlir::dyn_cast<DenseElementsAttr>(attr)) {
+    return elements.reshape(new_type);
+  }
+  if (auto resource_attr = mlir::dyn_cast<DenseResourceElementsAttr>(attr)) {
+    return DenseResourceElementsAttr::get(new_type,
+                                          resource_attr.getRawHandle());
+  }
+  return {};
 }
 
 bool L2NormalizeReduceAxis(Value sq_op, DenseElementsAttr axis) {
@@ -3373,5 +3390,4 @@ void OptimizePass::runOnOperation() {
   (void)applyPatternsGreedily(func, std::move(phase_2_patterns));
 }
 
-}  // namespace TFL
-}  // namespace mlir
+}  // namespace mlir::TFL
