@@ -37,7 +37,6 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "unsupported/Eigen/CXX11/Tensor"
 #include "xla/backends/cpu/collectives/cpu_collectives.h"
 #include "xla/executable_run_options.h"
 #include "xla/future.h"
@@ -79,6 +78,10 @@ limitations under the License.
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/protobuf.h"
+
+namespace Eigen {
+class ThreadPoolDevice;
+}  // namespace Eigen
 
 namespace xla {
 
