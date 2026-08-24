@@ -332,6 +332,84 @@ TEST_F(CompilationEnvironmentsTest, GetEnvTriggersFullNameFallback) {
   EXPECT_EQ(retrieved_env.some_flag(), kExpectedFallbackValue);
 }
 
+TEST_F(CompilationEnvironmentsTest, UnknownEnvTypeRoundTripsViaToProto) {
+  // Verify that unknown proto types survive a CreateFromProto -> ToProto
+  // round trip, preserving both the type URL and the opaque payload.
+  constexpr absl::string_view kUnknownTypeUrlA =
+      "type.googleapis.com/some.unknown.ProtoTypeA";
+  constexpr absl::string_view kUnknownPayloadA = "payload_a";
+  constexpr absl::string_view kUnknownTypeUrlB =
+      "type.googleapis.com/some.unknown.ProtoTypeB";
+  constexpr absl::string_view kUnknownPayloadB = "payload_b";
+
+  CompilationEnvironmentsProto proto;
+
+  // Add a known environment.
+  auto env1 = std::make_unique<TestCompilationEnvironment1>();
+  env1->set_some_flag(7);
+  proto.add_environments()->PackFrom(*env1);
+
+  // Add two "unknown" environments.
+  google::protobuf::Any* unknown1 = proto.add_environments();
+  unknown1->set_type_url(kUnknownTypeUrlA);
+  unknown1->set_value(kUnknownPayloadA);
+
+  google::protobuf::Any* unknown2 = proto.add_environments();
+  unknown2->set_type_url(kUnknownTypeUrlB);
+  unknown2->set_value(kUnknownPayloadB);
+
+  // Round-trip: CreateFromProto -> ToProto.
+  ASSERT_OK_AND_ASSIGN(auto envs,
+                       CompilationEnvironments::CreateFromProto(proto));
+  CompilationEnvironmentsProto output_proto = envs->ToProto();
+
+  // The output should contain the known env + both unknown envs.
+  ASSERT_EQ(output_proto.environments_size(), 3);
+
+  // The known env should be first (sorted by full_name).
+  EXPECT_THAT(output_proto.environments(0).type_url(),
+              ::testing::HasSubstr("TestCompilationEnvironment1"));
+
+  // The unknown envs should follow, preserving type URLs and payloads.
+  EXPECT_EQ(output_proto.environments(1).type_url(), kUnknownTypeUrlA);
+  EXPECT_EQ(output_proto.environments(1).value(), kUnknownPayloadA);
+  EXPECT_EQ(output_proto.environments(2).type_url(), kUnknownTypeUrlB);
+  EXPECT_EQ(output_proto.environments(2).value(), kUnknownPayloadB);
+}
+
+TEST_F(CompilationEnvironmentsTest, UnknownEnvTypePreservedOnCopy) {
+  // Verify that unknown environments are preserved across copy construction.
+  constexpr absl::string_view kUnknownTypeUrl =
+      "type.googleapis.com/some.unknown.InternalProto";
+  constexpr absl::string_view kUnknownPayload = "opaque_config_bytes";
+
+  CompilationEnvironmentsProto proto;
+
+  auto env1 = std::make_unique<TestCompilationEnvironment1>();
+  env1->set_some_flag(99);
+  proto.add_environments()->PackFrom(*env1);
+
+  google::protobuf::Any* unknown = proto.add_environments();
+  unknown->set_type_url(kUnknownTypeUrl);
+  unknown->set_value(kUnknownPayload);
+
+  ASSERT_OK_AND_ASSIGN(auto envs,
+                       CompilationEnvironments::CreateFromProto(proto));
+
+  // Copy construct.
+  auto envs_copy = std::make_unique<CompilationEnvironments>(*envs);
+  envs.reset();  // Destroy the original.
+
+  // The copy should still have the known env.
+  EXPECT_EQ(envs_copy->GetEnv<TestCompilationEnvironment1>().some_flag(), 99);
+
+  // The copy should round-trip the unknown env.
+  CompilationEnvironmentsProto copy_proto = envs_copy->ToProto();
+  ASSERT_EQ(copy_proto.environments_size(), 2);
+  EXPECT_EQ(copy_proto.environments(1).type_url(), kUnknownTypeUrl);
+  EXPECT_EQ(copy_proto.environments(1).value(), kUnknownPayload);
+}
+
 }  // namespace
 }  // namespace test
 }  // namespace xla

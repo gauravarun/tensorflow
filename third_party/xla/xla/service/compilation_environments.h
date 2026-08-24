@@ -18,7 +18,9 @@ limitations under the License.
 
 #include <functional>
 #include <memory>
+#include <vector>
 
+#include "google/protobuf/any.pb.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
@@ -139,6 +141,11 @@ class CompilationEnvironments {
   absl::flat_hash_map<const google::protobuf::Descriptor*,
                       std::unique_ptr<google::protobuf::Message>>
       environments_;
+
+  // Stores serialized environments whose proto type is not linked into this
+  // binary. These are preserved as opaque google.protobuf.Any entries so that
+  // ToProto() can round-trip them back without data loss.
+  std::vector<google::protobuf::Any> unknown_environments_;
 };
 
 // ----- Template implementation below -----

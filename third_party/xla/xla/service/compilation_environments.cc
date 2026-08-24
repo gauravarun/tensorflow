@@ -122,6 +122,7 @@ CompilationEnvironments& CompilationEnvironments::operator=(
     env->CopyFrom(*descriptor_message_pair.second);
     environments_.insert({descriptor_message_pair.first, std::move(env)});
   }
+  unknown_environments_ = rhs.unknown_environments_;
   return *this;
 }
 
@@ -145,8 +146,13 @@ CompilationEnvironments::CreateFromProto(
     const google::protobuf::Descriptor* const descriptor =
         pool->FindMessageTypeByName(fullname);
     if (descriptor == nullptr) {
-      return absl::DataLossError(absl::StrCat(
-          "Unknown CompilationEnvironment message type: ", fullname));
+      // The proto type is not linked into this binary. Preserve the raw Any
+      // so that ToProto() can round-trip it without data loss.
+      LOG(WARNING) << "Preserving unknown CompilationEnvironment message type "
+                      "as opaque bytes: "
+                   << fullname;
+      envs->unknown_environments_.push_back(env_proto);
+      continue;
     }
 
     const google::protobuf::Message* const prototype =
@@ -246,6 +252,10 @@ CompilationEnvironmentsProto CompilationEnvironments::ToProto() const {
   CompilationEnvironmentsProto proto;
   for (const auto* const descriptor : descriptors) {
     proto.add_environments()->PackFrom(*environments_.at(descriptor));
+  }
+  // Re-emit any environments whose proto type was not linked into this binary.
+  for (const auto& unknown_env : unknown_environments_) {
+    *proto.add_environments() = unknown_env;
   }
   return proto;
 }
